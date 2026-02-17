@@ -291,7 +291,8 @@ def _flash_attn_fwd(
     if max_seqlen_k is None:
         max_seqlen_k = seqlen_k
     seqlen_q_packgqa = max_seqlen_q * qhead_per_kvhead
-    if compute_capability == 10:
+    force_q_stage_1 = os.environ.get("FLASH_ATTN_CUTE_FORCE_Q_STAGE_1", "0") == "1"
+    if compute_capability == 10 and not force_q_stage_1:
         q_stage = 2 if seqlen_q_packgqa > m_block_size else 1
     else:
         q_stage = 1

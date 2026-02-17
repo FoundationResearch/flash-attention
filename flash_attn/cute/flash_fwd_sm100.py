@@ -14,6 +14,7 @@
 # https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/blackwell/fmha.py
 
 import enum
+import os
 import math
 from typing import Type, Tuple, Callable, Optional, Literal
 from functools import partial
@@ -1601,6 +1602,9 @@ class FlashAttentionForwardSm100:
             tStSi.layout, cute.make_layout((self.m_block_size, tilePlikeFP32))
         )
         tStP = cute.make_tensor(tStSi.iterator + self.tmem_s_to_p_offset, tStP_layout)
+        if const_expr(self.m_block_size == 64):
+            # Keep transformed TMEM views on the original base iterator.
+            tStScale = cute.make_tensor(tStSi.iterator, tStScale.layout)
 
         # Keep TMEM copy geometry consistent with tile_n.
         # Previous constants (32/16) are tuned for n_block_size=128.
@@ -2144,7 +2148,8 @@ class FlashAttentionForwardSm100:
                         # Don't need O_full anymore, since by the time softmax has signaled the correction
                         # warps, S_i must have been done, so O_i-1 must have been done as well.
                         # cute.arch.mbarrier_wait(mbar_ptr + self.mbar_O_full_offset + stage, o_corr_consumer_phase)
-                        if should_rescale:
+                        skip_rescale = const_expr(os.environ.get("FLASH_ATTN_CUTE_DEBUG_SKIP_CORRECTION_RESCALE", "0") == "1")
+                        if should_rescale and not skip_rescale:
                             self.correction_rescale(
                                 thr_mma_pv, tOtOs[stage], tidx, scale
                             )
@@ -2357,6 +2362,8 @@ class FlashAttentionForwardSm100:
         tOtO_i = cute.composition(tOtO, cute.make_layout((self.m_block_size, corr_tile_size)))
         tOcO_i = cute.composition(tOcO, cute.make_layout((self.m_block_size, corr_tile_size)))
         if const_expr(self.m_block_size == 64):
+            # Match bwd's handling: keep original TMEM iterator after layout transform.
+            tOtO_i = cute.make_tensor(tOtO.iterator, tOtO_i.layout)
             thr_tmem_load = cute_copy_utils.make_tmem_copy(tmem_load_atom, 1).get_slice(tidx)
             thr_tmem_store = cute_copy_utils.make_tmem_copy(tmem_store_atom, 1).get_slice(
                 tidx
@@ -2374,14 +2381,18 @@ class FlashAttentionForwardSm100:
         tOrO_frg = cute.make_fragment((tOrO_t2r_shape, frg_count), self.pv_acc_dtype)
         for i in cutlass.range_constexpr(frg_count):
             tOrO_frg = cute.make_fragment(tOrO_t2r_shape, self.pv_acc_dtype)
-            tOtO_t2r_i = cute.make_tensor(tOtO_t2r.iterator + i * corr_tile_size, tOtO_t2r.layout)
+            tOtO_t2r_i = cute.make_tensor(
+                tOtO_t2r.iterator + i * corr_tile_size, tOtO_t2r.layout
+            )
             cute.copy(thr_tmem_load, tOtO_t2r_i, tOrO_frg)
             for j in cutlass.range(0, cute.size(tOrO_frg), 2, unroll_full=True):
                 tOrO_frg[j], tOrO_frg[j + 1] = cute.arch.mul_packed_f32x2(
                     (tOrO_frg[j], tOrO_frg[j + 1]),
                     (scale, scale),
                 )
-            tOtO_r2t_i = cute.make_tensor(tOtO_r2t.iterator + i * corr_tile_size, tOtO_r2t.layout)
+            tOtO_r2t_i = cute.make_tensor(
+                tOtO_r2t.iterator + i * corr_tile_size, tOtO_r2t.layout
+            )
             cute.copy(thr_tmem_store, tOrO_frg, tOtO_r2t_i)
         cute.arch.fence_view_async_tmem_store()
 
