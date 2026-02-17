@@ -23,7 +23,7 @@ classifiers = [
 
 dependencies = [
     "nvidia-cutlass-dsl>=4.4.0.dev1",
-    "torch",
+    "torch>=2.10.0",
     "einops",
     "typing_extensions",
     "apache-tvm-ffi>=0.1.5,<0.2",
