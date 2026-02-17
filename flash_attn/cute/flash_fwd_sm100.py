@@ -1819,11 +1819,30 @@ class FlashAttentionForwardSm100:
                     self.q_subtile_factor if self.q_subtile_factor is not None else 1,
                 )
                 if not empty_tile:
-                    sScale[tidx + stage * self.m_block_size] = softmax.row_sum[0]
+                    row_sum_safe = softmax.row_sum[0]
+                    row_sum_invalid = (
+                        row_sum_safe != row_sum_safe
+                        or row_sum_safe == Float32.inf
+                        or row_sum_safe == -Float32.inf
+                        or row_sum_safe == 0.0
+                    )
+                    if row_sum_invalid:
+                        row_sum_safe = Float32(1.0)
                     if const_expr(mLSE is not None or learnable_sink is not None):
-                        sScale[
-                            tidx + stage * self.m_block_size + self.q_stage * self.m_block_size
-                        ] = softmax.row_max[0]
+                        row_max_safe = softmax.row_max[0]
+                        row_max_invalid = (
+                            row_max_safe != row_max_safe
+                            or row_max_safe == Float32.inf
+                            or row_max_safe == -Float32.inf
+                        )
+                        if row_max_invalid:
+                            row_max_safe = Float32(0.0)
+                    if tidx < self.m_block_size:
+                        sScale[tidx + stage * self.m_block_size] = row_sum_safe
+                        if const_expr(mLSE is not None or learnable_sink is not None):
+                            sScale[
+                                tidx + stage * self.m_block_size + self.q_stage * self.m_block_size
+                            ] = row_max_safe
                     # if tidx == 0:
                     #     cute.printf("softmax row sum stage %d: %f, row_max = %f\n", stage, softmax.row_sum[0], softmax.row_max[0])
                     # See block_sparse_utils.py NOTE [SM100 block-sparse empty tiles: mbarrier contract].
@@ -1889,11 +1908,30 @@ class FlashAttentionForwardSm100:
                             # Now that we no longer already have the 1st iteration, need mask_seqlen=True here
 
                     # Dense path always writes scale / signals
-                    sScale[tidx + stage * self.m_block_size] = softmax.row_sum[0]
+                    row_sum_safe = softmax.row_sum[0]
+                    row_sum_invalid = (
+                        row_sum_safe != row_sum_safe
+                        or row_sum_safe == Float32.inf
+                        or row_sum_safe == -Float32.inf
+                        or row_sum_safe == 0.0
+                    )
+                    if row_sum_invalid:
+                        row_sum_safe = Float32(1.0)
                     if const_expr(mLSE is not None or learnable_sink is not None):
-                        sScale[
-                            tidx + stage * self.m_block_size + self.q_stage * self.m_block_size
-                        ] = softmax.row_max[0]
+                        row_max_safe = softmax.row_max[0]
+                        row_max_invalid = (
+                            row_max_safe != row_max_safe
+                            or row_max_safe == Float32.inf
+                            or row_max_safe == -Float32.inf
+                        )
+                        if row_max_invalid:
+                            row_max_safe = Float32(0.0)
+                    if tidx < self.m_block_size:
+                        sScale[tidx + stage * self.m_block_size] = row_sum_safe
+                        if const_expr(mLSE is not None or learnable_sink is not None):
+                            sScale[
+                                tidx + stage * self.m_block_size + self.q_stage * self.m_block_size
+                            ] = row_max_safe
                     cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_softmax_corr_full_offset + stage)
 
             # # Write LSE to gmem
@@ -1991,6 +2029,7 @@ class FlashAttentionForwardSm100:
 
         if const_expr(mask_fn is not None):
             mask_fn(tSrS_t2r, n_block=n_block)
+        thread_idx = thr_tmem_load.thr_idx
         row_max, acc_scale = softmax.update_row_max(tSrS_t2r.load(), is_first)
 
         if const_expr(not is_first):
@@ -1998,8 +2037,13 @@ class FlashAttentionForwardSm100:
             # tSrScale_r2t[0] = acc_scale
             # cute.copy(thr_tmem_store_scale, tSrScale_r2t, tStScale_r2t)
             # cute.arch.fence_view_async_tmem_store()
-            thread_idx = thr_tmem_load.thr_idx
-            sScale[thread_idx + stage * self.m_block_size] = acc_scale
+            acc_scale_invalid = (
+                acc_scale != acc_scale or acc_scale == Float32.inf or acc_scale == -Float32.inf
+            )
+            if acc_scale_invalid:
+                acc_scale = Float32(1.0)
+            if thread_idx < self.m_block_size:
+                sScale[thread_idx + stage * self.m_block_size] = acc_scale
             # if thread_idx == 0: cute.printf("softmax acc_scale stage %d: %f, row_max = %f\n", stage, acc_scale, row_max)
         # Notify correction wg that row_max is ready
         cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_softmax_corr_full_offset + stage)
@@ -2024,6 +2068,9 @@ class FlashAttentionForwardSm100:
             e2e=mask_fn is None and self.head_dim_padded <= 128,
             e2e_freq=self.e2e_freq,
         )
+        if thread_idx >= self.m_block_size:
+            for i in cutlass.range_constexpr(cute.size(tSrP_r2t_f32)):
+                tSrP_r2t_f32[i] = Float32(0.0)
         # Sequence barrier arrive
         if const_expr(self.s0_s1_barrier):
             cute.arch.mbarrier_arrive(mbar_ptr + mbar_s0_s1_sequence_offset + (1 - stage) * 4)
@@ -2155,7 +2202,7 @@ class FlashAttentionForwardSm100:
                         # cute.copy(tiled_tmem_load_vec, tStScales_t2r[stage], tSrScale_t2r)
                         # cute.arch.fence_view_async_tmem_load()
                         # scale = tSrScale_t2r[0]
-                        scale = sScale[tidx + stage * self.m_block_size]
+                        scale = sScale[tidx + stage * self.m_block_size] if tidx < self.m_block_size else Float32(1.0)
                         should_rescale = cute.arch.vote_ballot_sync(scale < 1.0) != 0
                         # should_rescale = True
                         # if tidx == 0: cute.printf("Correction scale i = %d, for stage %d: %f, should_rescale = %d\n", i, stage, scale, should_rescale)
@@ -2192,10 +2239,13 @@ class FlashAttentionForwardSm100:
                         learnable_sink_val = [sink_val] * self.q_stage
                     else:  # Each thread might have a different sink value due to different q_head
                         for stage in cutlass.range_constexpr(self.q_stage):
-                            q_head_idx = (
-                                (self.q_stage * m_block + stage) * self.m_block_size + tidx
-                            ) % self.qhead_per_kvhead + head_idx * self.qhead_per_kvhead
-                            learnable_sink_val[stage] = Float32(learnable_sink[q_head_idx])
+                            if tidx < self.m_block_size:
+                                q_head_idx = (
+                                    (self.q_stage * m_block + stage) * self.m_block_size + tidx
+                                ) % self.qhead_per_kvhead + head_idx * self.qhead_per_kvhead
+                                learnable_sink_val[stage] = Float32(learnable_sink[q_head_idx])
+                            else:
+                                learnable_sink_val[stage] = Float32(0.0)
                 for stage in cutlass.range_constexpr(self.q_stage):
                     cute.arch.mbarrier_wait(
                         mbar_ptr + self.mbar_softmax_corr_full_offset + stage,
@@ -2204,11 +2254,31 @@ class FlashAttentionForwardSm100:
                     # cute.copy(tiled_tmem_load_vec, tStScales_t2r[stage], tSrScale_t2r)
                     # cute.arch.fence_view_async_tmem_load()
                     # scale = tSrScale_t2r[0]
-                    row_sum = sScale[tidx + stage * self.m_block_size]
+                    row_sum = sScale[tidx + stage * self.m_block_size] if tidx < self.m_block_size else Float32(1.0)
                     if const_expr(mLSE is not None or learnable_sink is not None):
-                        row_max = sScale[tidx + stage * self.m_block_size + self.q_stage * self.m_block_size]
+                        row_max = (
+                            sScale[tidx + stage * self.m_block_size + self.q_stage * self.m_block_size]
+                            if tidx < self.m_block_size
+                            else -Float32.inf
+                        )
                     else:
                         row_max = None
+                    row_sum_invalid = (
+                        row_sum != row_sum
+                        or row_sum == Float32.inf
+                        or row_sum == -Float32.inf
+                        or row_sum == 0.0
+                    )
+                    if row_sum_invalid:
+                        row_sum = Float32(1.0)
+                    if const_expr(mLSE is not None or learnable_sink is not None):
+                        row_max_invalid = (
+                            row_max != row_max
+                            or row_max == Float32.inf
+                            or row_max == -Float32.inf
+                        )
+                        if row_max_invalid:
+                            row_max = Float32(0.0)
                     cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_softmax_corr_empty_offset + stage)
                     if const_expr(learnable_sink is not None):
                         LOG2_E = math.log2(math.e)
