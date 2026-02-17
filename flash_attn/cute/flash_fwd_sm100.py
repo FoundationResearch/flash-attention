@@ -151,13 +151,27 @@ class FlashAttentionForwardSm100:
             "Paged KV does not support irregular head dim"
         )
 
-        self.softmax0_warp_ids = (0, 1, 2, 3)
-        self.softmax1_warp_ids = (4, 5, 6, 7)
-        self.correction_warp_ids = (8, 9, 10, 11)
-        self.mma_warp_id = 12
-        self.epilogue_warp_ids = (13,)
-        self.load_warp_ids = (14,)
-        self.empty_warp_ids = (15,)
+        use_m64_exp_warp_topo = (
+            self.m_block_size == 64
+            and os.environ.get("FLASH_ATTN_CUTE_M64_EXPERIMENTAL_WARP_TOPO", "0") == "1"
+        )
+        if use_m64_exp_warp_topo:
+            # Experimental m=64 topology. Disabled by default since compile can be very slow.
+            self.softmax0_warp_ids = (0, 1)
+            self.softmax1_warp_ids = (2, 3)
+            self.correction_warp_ids = (4, 5)
+            self.mma_warp_id = 6
+            self.epilogue_warp_ids = (7,)
+            self.load_warp_ids = (8,)
+            self.empty_warp_ids = (9, 10, 11)
+        else:
+            self.softmax0_warp_ids = (0, 1, 2, 3)
+            self.softmax1_warp_ids = (4, 5, 6, 7)
+            self.correction_warp_ids = (8, 9, 10, 11)
+            self.mma_warp_id = 12
+            self.epilogue_warp_ids = (13,)
+            self.load_warp_ids = (14,)
+            self.empty_warp_ids = (15,)
         SM100_TMEM_CAPACITY_COLUMNS = 512
         self.tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
 
