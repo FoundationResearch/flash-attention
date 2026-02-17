@@ -31,6 +31,7 @@ from quack import copy_utils
 
 from flash_attn.cute.paged_kv import PagedKVManager
 import flash_attn.cute.utils as utils
+import flash_attn.cute.copy_utils as cute_copy_utils
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 import flash_attn.cute.pipeline as pipeline
 from flash_attn.cute.mask import AttentionMask
@@ -1611,23 +1612,38 @@ class FlashAttentionForwardSm100:
             tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(tmem_load_rep)),
             Float32,
         )
-        thr_tmem_load = tcgen05.make_tmem_copy(tmem_load_atom, tStSi).get_slice(tidx)
+        if const_expr(self.m_block_size == 64):
+            thr_tmem_load = cute_copy_utils.make_tmem_copy(tmem_load_atom, 1).get_slice(tidx)
+        else:
+            thr_tmem_load = tcgen05.make_tmem_copy(tmem_load_atom, tStSi).get_slice(tidx)
         tStS_t2r = thr_tmem_load.partition_S(tStSi)
 
         tmem_store_scale_atom = cute.make_copy_atom(
             tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(1)),
             Float32,
         )
-        thr_tmem_store_scale = tcgen05.make_tmem_copy(tmem_store_scale_atom, tStScale).get_slice(
-            tidx
-        )
+        if const_expr(self.m_block_size == 64):
+            thr_tmem_store_scale = cute_copy_utils.make_tmem_copy(
+                tmem_store_scale_atom, 1
+            ).get_slice(tidx)
+        else:
+            thr_tmem_store_scale = tcgen05.make_tmem_copy(
+                tmem_store_scale_atom, tStScale
+            ).get_slice(tidx)
 
         tStScale_r2t = thr_tmem_store_scale.partition_D(tStScale)
         tmem_store_atom = cute.make_copy_atom(
             tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(tmem_store_rep)),
             Float32,
         )
-        thr_tmem_store = tcgen05.make_tmem_copy(tmem_store_atom, tStP).get_slice(tidx)
+        if const_expr(self.m_block_size == 64):
+            thr_tmem_store = cute_copy_utils.make_tmem_copy(tmem_store_atom, 1).get_slice(
+                tidx
+            )
+        else:
+            thr_tmem_store = tcgen05.make_tmem_copy(tmem_store_atom, tStP).get_slice(
+                tidx
+            )
         tStP_r2t = thr_tmem_store.partition_D(tStP)
 
         mma_si_consumer_phase = Int32(0)
@@ -2048,7 +2064,14 @@ class FlashAttentionForwardSm100:
             tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(1)),
             self.qk_acc_dtype,
         )
-        thr_tmem_load_vec = tcgen05.make_tmem_copy(tmem_load_v_atom, tStScales[0]).get_slice(tidx)
+        if const_expr(self.m_block_size == 64):
+            thr_tmem_load_vec = cute_copy_utils.make_tmem_copy(tmem_load_v_atom, 1).get_slice(
+                tidx
+            )
+        else:
+            thr_tmem_load_vec = tcgen05.make_tmem_copy(
+                tmem_load_v_atom, tStScales[0]
+            ).get_slice(tidx)
 
         tStScales_t2r = [thr_tmem_load_vec.partition_S(tStScales[stage]) for stage in range(self.q_stage)]
         tSrScale_t2r_shape = thr_tmem_load_vec.partition_D(tScScale).shape
@@ -2333,8 +2356,16 @@ class FlashAttentionForwardSm100:
         )
         tOtO_i = cute.composition(tOtO, cute.make_layout((self.m_block_size, corr_tile_size)))
         tOcO_i = cute.composition(tOcO, cute.make_layout((self.m_block_size, corr_tile_size)))
-        thr_tmem_load = tcgen05.make_tmem_copy(tmem_load_atom, tOtO_i).get_slice(tidx)
-        thr_tmem_store = tcgen05.make_tmem_copy(tmem_store_atom, tOtO_i).get_slice(tidx)
+        if const_expr(self.m_block_size == 64):
+            thr_tmem_load = cute_copy_utils.make_tmem_copy(tmem_load_atom, 1).get_slice(tidx)
+            thr_tmem_store = cute_copy_utils.make_tmem_copy(tmem_store_atom, 1).get_slice(
+                tidx
+            )
+        else:
+            thr_tmem_load = tcgen05.make_tmem_copy(tmem_load_atom, tOtO_i).get_slice(tidx)
+            thr_tmem_store = tcgen05.make_tmem_copy(tmem_store_atom, tOtO_i).get_slice(
+                tidx
+            )
         tOtO_t2r = thr_tmem_load.partition_S(tOtO_i)
         tOrO_t2r_shape = thr_tmem_load.partition_D(tOcO_i).shape
         tOtO_r2t = thr_tmem_store.partition_D(tOtO_i)
@@ -2393,10 +2424,31 @@ class FlashAttentionForwardSm100:
         """
 
         corr_tile_size = 32 * 8 // self.o_dtype.width
-        tOsO = thr_mma.partition_C(sO)
+        sO_base = sO
+        if const_expr(self.m_block_size == 64):
+            # Keep SMEM store atom alignment constraints satisfiable in m=64 branch.
+            sO_ptr_aligned = cute.make_ptr(
+                sO.element_type,
+                sO.iterator.toint(),
+                mem_space=cute.AddressSpace.smem,
+                assumed_align=16,
+            )
+            sO_base = cute.make_tensor(sO_ptr_aligned, sO.layout)
+        tOsO = thr_mma.partition_C(sO_base)
         tOcO = thr_mma.partition_C(cute.make_identity_tensor(self.mma_tiler_pv[:2]))
 
-        tOtO_i = cute.logical_divide(tOtO, cute.make_layout((self.m_block_size, corr_tile_size)))
+        tOtO_base = tOtO
+        if const_expr(self.m_block_size == 64):
+            # m_block_size=64 path may lose TMEM alignment metadata after view ops.
+            tOtO_ptr_aligned = cute.make_ptr(
+                tOtO.element_type,
+                tOtO.iterator.toint(),
+                mem_space=cute.AddressSpace.tmem,
+                assumed_align=16,
+            )
+            tOtO_base = cute.make_tensor(tOtO_ptr_aligned, tOtO.layout)
+
+        tOtO_i = cute.logical_divide(tOtO_base, cute.make_layout((self.m_block_size, corr_tile_size)))
         tOcO_i = cute.logical_divide(tOcO, cute.make_layout((self.m_block_size, corr_tile_size)))
         tOsO_i = cute.logical_divide(tOsO, cute.make_layout((self.m_block_size, corr_tile_size)))
 
@@ -2413,9 +2465,13 @@ class FlashAttentionForwardSm100:
             tidx
         )
         thr_tmem_load = tiled_tmem_load.get_slice(tidx)
-        smem_copy_atom = sm100_utils_basic.get_smem_store_op(
-            self.o_layout, self.o_dtype, self.pv_acc_dtype, tiled_tmem_load
-        )
+        if const_expr(self.m_block_size == 64):
+            # Avoid stmatrix alignment constraints in the specialized m=64 path.
+            smem_copy_atom = cute.make_copy_atom(sm100_utils_basic.CopyUniversalOp(), self.o_dtype)
+        else:
+            smem_copy_atom = sm100_utils_basic.get_smem_store_op(
+                self.o_layout, self.o_dtype, self.pv_acc_dtype, tiled_tmem_load
+            )
         tiled_smem_store = cute.make_tiled_copy_D(smem_copy_atom, tiled_tmem_load)
 
         tOtO_t2r = thr_tmem_load.partition_S(tOtO_i[(None, None), None])
