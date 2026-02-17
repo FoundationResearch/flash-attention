@@ -1601,8 +1601,14 @@ class FlashAttentionForwardSm100:
         )
         tStP = cute.make_tensor(tStSi.iterator + self.tmem_s_to_p_offset, tStP_layout)
 
+        # Keep TMEM copy geometry consistent with tile_n.
+        # Previous constants (32/16) are tuned for n_block_size=128.
+        tmem_load_rep = self.n_block_size // 4
+        tmem_store_rep = self.n_block_size // 8
+        assert self.n_block_size % 8 == 0
+
         tmem_load_atom = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)),
+            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(tmem_load_rep)),
             Float32,
         )
         thr_tmem_load = tcgen05.make_tmem_copy(tmem_load_atom, tStSi).get_slice(tidx)
@@ -1618,7 +1624,7 @@ class FlashAttentionForwardSm100:
 
         tStScale_r2t = thr_tmem_store_scale.partition_D(tStScale)
         tmem_store_atom = cute.make_copy_atom(
-            tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(16)),
+            tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(tmem_store_rep)),
             Float32,
         )
         thr_tmem_store = tcgen05.make_tmem_copy(tmem_store_atom, tStP).get_slice(tidx)
