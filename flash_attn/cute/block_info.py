@@ -23,6 +23,8 @@ class BlockInfo:
     # If True, the scheduler packs num_splits into the top 16 bits of split_idx
     pack_split_idx: cutlass.Constexpr[bool] = False
     num_n_blocks_per_split: Optional[cutlass.Constexpr[Int32]] = None
+    # Must match AttentionMask.window_left_chunk; see there.
+    window_left_chunk: Optional[cutlass.Constexpr[int]] = None
 
     @cute.jit
     def get_n_block_min_max(
@@ -80,6 +82,9 @@ class BlockInfo:
             n_idx_max = (n_block + 1) * self.tile_n
             m_idx = n_idx_max + seqlen_info.seqlen_q - seqlen_info.seqlen_k
             m_idx_left = m_idx + self.window_size_left
+            if const_expr(self.window_left_chunk is not None):
+                # Exclusive q bound of the last visible chunk; see AttentionMask.
+                m_idx_left = m_idx_left & -self.window_left_chunk
             m_block_max = min(m_block_max, cute.ceil_div(m_idx_left, self.tile_m))
         return m_block_min, m_block_max
 
@@ -147,6 +152,11 @@ class BlockInfo:
             m_idx_max = (m_block + 1) * self.tile_m
             if const_expr(self.qhead_per_kvhead_packgqa > 1):
                 m_idx_max = cute.ceil_div(m_idx_max, self.qhead_per_kvhead_packgqa)
+            if const_expr(self.window_left_chunk is not None):
+                # The chunk-aligned edge of the tile's last row is that of its chunk's
+                # last row, so round the exclusive row bound up to a chunk multiple.
+                chunk = self.window_left_chunk
+                m_idx_max = cute.ceil_div(m_idx_max, chunk) * chunk
             n_idx = m_idx_max + seqlen_info.seqlen_k - seqlen_info.seqlen_q
             n_idx_left = n_idx - self.window_size_left
             return cutlass.max(n_block_min, cute.ceil_div(n_idx_left, self.tile_n))

@@ -68,7 +68,9 @@ class FlashAttentionBackwardSm100:
         has_aux_tensors: cutlass.Constexpr = False,
         q_subtile_factor: cutlass.Constexpr[int] = 1,
         kv_subtile_factor: cutlass.Constexpr[int] = 1,
+        window_left_chunk: Optional[int] = None,
     ):
+        self.window_left_chunk = window_left_chunk
         # padding head_dim to a multiple of 16 as k_block_size
         hdim_multiple_of = 16
         self.tile_hdim = int(math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of)
@@ -1020,6 +1022,7 @@ class FlashAttentionBackwardSm100:
             swap_AB=True,
             window_size_left=window_size_left,
             window_size_right=window_size_right,
+            window_left_chunk=self.window_left_chunk,
         )
 
     @cute.kernel
@@ -1411,6 +1414,7 @@ class FlashAttentionBackwardSm100:
             window_size_left,
             window_size_right,
             qhead_per_kvhead_packgqa=1,
+            window_left_chunk=self.window_left_chunk,
         )
         SeqlenInfoCls = partial(
             SeqlenInfoQK.create,

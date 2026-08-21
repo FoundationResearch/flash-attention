@@ -164,6 +164,10 @@ class AttentionMask:
     window_size_right: Optional[Int32] = None
     qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1  # only pass in if we're doing PackGQA
     swap_AB: cutlass.Constexpr[bool] = False
+    # Chunk-aligned left window edge (SM100 forward only): every query uses the left
+    # edge of the last row of its chunk, so KV chunks are visible or masked whole.
+    # Requires window_size_left + 1 to be a multiple of the chunk size.
+    window_left_chunk: cutlass.Constexpr[Optional[int]] = None
 
     @property
     def seqlen_q(self) -> Int32:
@@ -748,8 +752,13 @@ class AttentionMask:
                     col_limit_right = self.tile_n
                 if const_expr(mask_seqlen):
                     col_limit_right = cutlass.min(col_limit_right, seqlenk_col_limit)
+                if const_expr(self.window_left_chunk is not None):
+                    chunk = self.window_left_chunk
+                    row_idx_left = (row_idx & -chunk) + (chunk - 1)
+                else:
+                    row_idx_left = row_idx
                 col_limit_left = (
-                    row_idx + local_row_offset_left
+                    row_idx_left + local_row_offset_left
                     if const_expr(self.window_size_left is not None)
                     else 0
                 )
@@ -926,6 +935,15 @@ class AttentionMask:
                     row_limit_top = 0
                 if const_expr(self.window_size_left is not None):
                     row_limit_bot = causal_offset + self.window_size_left
+                    if const_expr(self.window_left_chunk is not None):
+                        # Chunk-aligned: q is visible iff (q & -chunk) <= k + wsl - chunk + 1,
+                        # i.e. iff q <= ((k + wsl - chunk + 1) & -chunk) + chunk - 1. The
+                        # column k is constant per thread, so this stays a row threshold.
+                        chunk = self.window_left_chunk
+                        q_row_base = m_block * self.tile_m + thr_row_offset
+                        row_limit_bot = (
+                            ((row_limit_bot + q_row_base - chunk + 1) & -chunk) + chunk - 1
+                        ) - q_row_base
                 if const_expr(mask_seqlen):
                     if seqlenk_col_limit <= 0:
                         row_limit_top = self.tile_m

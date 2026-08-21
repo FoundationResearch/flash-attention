@@ -559,6 +559,7 @@ def _flash_attn_fwd(
     scheduler_metadata: Optional[SchedulerMetadataTensorsTorch] = None,
     seqlen_k_per_split: Optional[int] = None,
     disable_scheduler_metadata: bool = False,
+    window_left_chunk: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Forward pass for FlashAttention.
 
@@ -768,6 +769,15 @@ def _flash_attn_fwd(
     causal, local, window_size_left, window_size_right = _resolve_causal_local_window(
         causal, window_size_left, window_size_right, mask_mod
     )
+    if window_left_chunk is not None:
+        assert arch // 10 in [10, 11], "window_left_chunk is only implemented on the SM100 forward"
+        assert local and window_size_left is not None, "window_left_chunk requires a left window"
+        assert window_left_chunk > 0 and window_left_chunk & (window_left_chunk - 1) == 0, (
+            "window_left_chunk must be a power of two"
+        )
+        assert (window_size_left + 1) % window_left_chunk == 0, (
+            "window_size_left + 1 must be a multiple of window_left_chunk"
+        )
 
     requested_use_clc_scheduler = utils._get_use_clc_scheduler_default()
     requested_disable_2cta = utils._get_disable_2cta_default(is_fwd=True)
@@ -1121,6 +1131,7 @@ def _flash_attn_fwd(
         page_table is not None,
         window_size_left is not None,
         window_size_right is not None,
+        window_left_chunk,
         (
             torch2cute_dtype_map[learnable_sink.dtype]
             if learnable_sink is not None
@@ -1357,6 +1368,11 @@ def _flash_attn_fwd(
                 )
                 if not use_dedicated_hd256_kernel:
                     fa_fwd_kwargs["has_tile_count_semaphore"] = tile_count_semaphore is not None
+                if window_left_chunk is not None:
+                    assert not use_dedicated_hd256_kernel, (
+                        "window_left_chunk is not supported by the hd256 2CTA kernel"
+                    )
+                    fa_fwd_kwargs["window_left_chunk"] = window_left_chunk
                 fa_fwd = flash_fwd_obj_cls(head_dim, head_dim_v, **fa_fwd_kwargs)
         elif arch // 10 == 12:
             # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity
@@ -1847,6 +1863,7 @@ def _flash_attn_bwd(
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     dlse: Optional[torch.Tensor] = None,
     learnable_sink: Optional[torch.Tensor] = None,
+    window_left_chunk: Optional[int] = None,
 ) -> Tuple[torch.Tensor, ...]:
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
     fake_mode = is_fake_mode()
@@ -1887,6 +1904,16 @@ def _flash_attn_bwd(
     causal, local, window_size_left, window_size_right = _resolve_causal_local_window(
         causal, window_size_left, window_size_right
     )
+    if window_left_chunk is not None:
+        assert arch // 10 in [10, 11], "window_left_chunk is only implemented on the SM100 backward"
+        assert local and window_size_left is not None, "window_left_chunk requires a left window"
+        assert not pack_gqa, "window_left_chunk backward does not support pack_gqa"
+        assert window_left_chunk > 0 and window_left_chunk & (window_left_chunk - 1) == 0, (
+            "window_left_chunk must be a power of two"
+        )
+        assert (window_size_left + 1) % window_left_chunk == 0, (
+            "window_size_left + 1 must be a multiple of window_left_chunk"
+        )
 
     if arch // 10 == 12:
         # SM120: uses SM80 MMA with 99 KB SMEM, 128 threads (4 warps).
@@ -2347,6 +2374,7 @@ def _flash_attn_bwd(
             causal,
             window_size_left is not None,
             window_size_right is not None,
+            window_left_chunk,
             m_block_size,
             n_block_size,
             num_threads,
@@ -2509,6 +2537,11 @@ def _flash_attn_bwd(
                     has_aux_tensors=aux_tensors is not None,
                     q_subtile_factor=q_subtile_factor,
                     kv_subtile_factor=kv_subtile_factor,
+                    window_left_chunk=window_left_chunk,
+                )
+            if window_left_chunk is not None:
+                assert not use_dedicated_hd256_kernel, (
+                    "window_left_chunk is not supported by the hd256 2CTA backward kernel"
                 )
 
         # Block sparse tensors for backward use Q-direction indexing (transposed from forward).

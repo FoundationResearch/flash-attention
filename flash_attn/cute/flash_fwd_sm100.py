@@ -160,8 +160,10 @@ class FlashAttentionForwardSm100:
         use_clc_scheduler: bool = False,
         has_tile_count_semaphore: bool = False,
         seqlen_k_per_split: Optional[int] = None,
+        window_left_chunk: Optional[int] = None,
     ):
         self.use_tma_KV = not paged_kv_non_tma
+        self.window_left_chunk = window_left_chunk
         # self.dtype = dtype
         # padding head_dim to a multiple of 16 as k_block_size
         hdim_multiple_of = 16
@@ -870,6 +872,7 @@ class FlashAttentionForwardSm100:
             qhead_per_kvhead_packgqa=(
                 self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1
             ),
+            window_left_chunk=self.window_left_chunk,
         )
 
     #  GPU device kernel
@@ -1170,6 +1173,7 @@ class FlashAttentionForwardSm100:
             num_splits=num_splits,
             pack_split_idx=num_splits_dynamic_ptr is not None,
             num_n_blocks_per_split=self.num_n_blocks_per_split,
+            window_left_chunk=self.window_left_chunk,
         )
         SeqlenInfoCls = partial(
             SeqlenInfoQK.create,
