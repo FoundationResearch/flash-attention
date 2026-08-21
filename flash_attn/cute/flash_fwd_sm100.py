@@ -14,6 +14,7 @@
 # https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/blackwell/fmha.py
 
 import math
+import os
 from typing import Tuple, Callable, Optional, Literal, NamedTuple
 from functools import partial
 
@@ -21,8 +22,8 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Int32, Int64, Boolean, const_expr
-from cutlass.cute.nvgpu import cpasync
+from cutlass import Float16, Float32, Int32, Int64, Boolean, const_expr
+from cutlass.cute.nvgpu import cpasync, warp
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
 from cutlass import pipeline
@@ -161,9 +162,24 @@ class FlashAttentionForwardSm100:
         has_tile_count_semaphore: bool = False,
         seqlen_k_per_split: Optional[int] = None,
         window_left_chunk: Optional[int] = None,
+        rel_bias: bool = False,
     ):
         self.use_tma_KV = not paged_kv_non_tma
         self.window_left_chunk = window_left_chunk
+        # Learned relative-position bias (Inkling-style r_q . P[:, q-k]) added to S.
+        # The correction warps compute each (tile_m x tile_n) bias tile with warp MMAs,
+        # shear it through a warp-private smem buffer and write it straight into the S
+        # accumulator in tmem before the QK MMA, which then accumulates onto it. The
+        # softmax warps never see it.
+        self.rel_bias = rel_bias
+        if rel_bias:
+            assert m_block_size == 128 and n_block_size == 128 and q_stage == 2, (
+                "rel_bias requires the 128x128, q_stage=2 SM100 configuration"
+            )
+            assert not (pack_gqa or is_split_kv or use_2cta_instrs or paged_kv_non_tma), (
+                "rel_bias does not support pack_gqa, split-KV, 2CTA or non-TMA paged KV"
+            )
+            assert is_local, "rel_bias requires a sliding window (the bias has finite extent)"
         # self.dtype = dtype
         # padding head_dim to a multiple of 16 as k_block_size
         hdim_multiple_of = 16
@@ -251,6 +267,19 @@ class FlashAttentionForwardSm100:
             (self.head_dim_padded == 192 and self.head_dim_v_padded >= 64) or
             (self.head_dim_v_padded >= 128 and self.is_split_kv)
         )
+        # Sheared bias rows, one per S row plus one leading pad row that absorbs
+        # clamped out-of-tile stores. Pitch 128 + 8 f16 (272 B) keeps the 32 consecutive
+        # row reads of a warp bank-conflict free.
+        self.sB_pitch = n_block_size + 8 if rel_bias else 0
+        self.sB_rows = m_block_size + 1 if rel_bias else 0
+        # Operand staging for the bias MMAs (cp.async, per q-stage): the 320-row window
+        # of P rows a (stage, n-block) pair touches and the 128 rows of r of the q-tile.
+        self.sP_rows = 320 if rel_bias else 0
+        self.sR_rows = m_block_size if rel_bias else 0
+        self.d_rel = 16
+        if rel_bias:
+            # Aliasing sO onto sQ is free here (measured) and pays for the bias buffer.
+            self.overlap_sO_sQ = True
 
         assert self.use_tma_KV or not (self.check_hdim_oob or self.check_hdim_v_oob), (
             "Paged KV does not support irregular head dim"
@@ -400,7 +429,11 @@ class FlashAttentionForwardSm100:
         # Cap small head_dim from over-staging: the 224*1024 budget undercounts
         # per-stage state, so at hd_padded=16 the unbounded formula picks 52 stages
         # and overflows the 227 KB SMEM cap. No-op for hd_padded >= 32 (max 26).
-        kv_stage = min((224 * 1024 - smem_size_q_o) // smem_size_kv_per_stage, 32)
+        smem_size_bias = (
+            self.sB_rows * self.sB_pitch * Float16.width
+            + self.q_stage * (self.sP_rows + self.sR_rows) * self.d_rel * 16
+        ) // 8
+        kv_stage = min((224 * 1024 - smem_size_q_o - smem_size_bias) // smem_size_kv_per_stage, 32)
         if self.head_dim_padded == 192 and self.head_dim_v_padded == 128 and kv_stage == 2:
             # For hdim 192,128, we can fit 3 stages if we use uneven_kv_smem
              kv_stage = 3
@@ -452,6 +485,8 @@ class FlashAttentionForwardSm100:
         mCuTotalSplitsMBlocks: Optional[cute.Tensor] = None,
         mBlocksToBatchIdx: Optional[cute.Tensor] = None,
         max_seqlen_q: Int32 | int | None = None,
+        mRelR: Optional[cute.Tensor] = None,  # (b, s_q + 256, h, 16) relative features r
+        mRelP: Optional[cute.Tensor] = None,  # (window + 640, 16) P^T, reversed/padded, / softmax_scale
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -754,6 +789,10 @@ class FlashAttentionForwardSm100:
         sched_response_size = self.sched_stages * 4 if self.dynamic_persistent else 0
         sched_mbar_size = self.sched_stages * 2 if self.dynamic_persistent else 0
         load_epi_mbar_size = 2 if const_expr(self.overlap_sO_sQ) else 0
+        bias_mbar_size = self.q_stage * 2 if const_expr(self.rel_bias) else 0
+        sB_size = self.sB_rows * self.sB_pitch
+        sP_size = self.q_stage * self.sP_rows * self.d_rel
+        sR_size = self.q_stage * self.sR_rows * self.d_rel
 
         @cute.struct
         class SharedStorage:
@@ -767,6 +806,10 @@ class FlashAttentionForwardSm100:
             # mbar_softmax_stats: cute.struct.MemRange[Int64, self.q_stage * 4 * 2]
             mbar_O_epi: cute.struct.MemRange[Int64, self.q_stage * 2]
             mbar_load_epi: cute.struct.MemRange[Int64, load_epi_mbar_size]
+            # rel_bias: correction -> MMA "bias tile is in S" and MMA -> correction "PV
+            # has consumed P" (one full/empty pair per q-stage each; only full is used).
+            mbar_bias: cute.struct.MemRange[Int64, bias_mbar_size]
+            mbar_p_consumed: cute.struct.MemRange[Int64, bias_mbar_size]
             mbar_s0_s1_sequence: cute.struct.MemRange[Int64, 2 * 2]
             # Tmem dealloc cluster barrier
             tmem_dealloc_mbar: Int64
@@ -793,6 +836,11 @@ class FlashAttentionForwardSm100:
                 cute.struct.MemRange[self.k_dtype, sKV_size],
                 self.buffer_align_bytes,
             ]
+            # rel_bias: sheared f16 bias rows (sB_rows x sB_pitch), warp-private by row,
+            # plus the cp.async-staged P window and r rows per q-stage.
+            sB: cute.struct.Align[cute.struct.MemRange[Float16, sB_size], 128]
+            sP: cute.struct.Align[cute.struct.MemRange[Float16, sP_size], 128]
+            sR: cute.struct.Align[cute.struct.MemRange[Float16, sR_size], 128]
 
         self.shared_storage = SharedStorage
 
@@ -854,6 +902,8 @@ class FlashAttentionForwardSm100:
             aux_data,
             fastdiv_mods,
             head_divmod,
+            mRelR,
+            mRelP,
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -918,6 +968,8 @@ class FlashAttentionForwardSm100:
         aux_data: AuxData = AuxData(),
         fastdiv_mods=(None, None),
         head_divmod=None,
+        mRelR: Optional[cute.Tensor] = None,
+        mRelP: Optional[cute.Tensor] = None,
     ):
         """The device kernel implementation of the Fused Multi-Head Attention.
 
@@ -1102,6 +1154,30 @@ class FlashAttentionForwardSm100:
                 defer_sync=True,
             )
 
+        pipeline_bias = None
+        pipeline_p_consumed = None
+        if const_expr(self.rel_bias):
+            # Correction warps (one elected arrive per warp) -> MMA: S[stage] holds the
+            # next block's bias, QK may accumulate onto it.
+            pipeline_bias = pipeline_custom.PipelineAsyncUmma.create(
+                barrier_storage=storage.mbar_bias.data_ptr(),
+                num_stages=self.q_stage,
+                producer_group=ThreadCooperativeGroup(len(self.correction_warp_ids)),
+                consumer_group=mma_warp,
+                cta_layout_vmnk=cta_layout_vmnk,
+                defer_sync=True,
+            )
+            # MMA (tcgen05.commit after PV) -> correction: P[stage] was consumed, the hi
+            # half of S[stage] may be overwritten.
+            pipeline_p_consumed = pipeline_custom.PipelineUmmaAsync.create(
+                barrier_storage=storage.mbar_p_consumed.data_ptr(),
+                num_stages=self.q_stage,
+                producer_group=mma_warp,
+                consumer_group=correction_threads_cluster,
+                cta_layout_vmnk=cta_layout_vmnk,
+                defer_sync=True,
+            )
+
         pipeline_load_epi = None
         if const_expr(self.overlap_sO_sQ and self.is_persistent):
             # when overlapping sO and sQ with a persistent kernel, we need this
@@ -1138,6 +1214,21 @@ class FlashAttentionForwardSm100:
             sO = cute.make_tensor(cute.recast_ptr(sQ.iterator, sO_layout.inner, self.o_dtype), sO_layout.outer)
 
         sScale = storage.sScale.get_tensor(cute.make_layout(self.q_stage * self.m_block_size * 2))
+        sB = None
+        sP = None
+        sR = None
+        if const_expr(self.rel_bias):
+            sB = storage.sB.get_tensor(
+                cute.make_layout((self.sB_rows, self.sB_pitch), stride=(self.sB_pitch, 1))
+            )
+            sP = storage.sP.get_tensor(
+                cute.make_layout((self.sP_rows, self.d_rel, self.q_stage),
+                                 stride=(self.d_rel, 1, self.sP_rows * self.d_rel))
+            )
+            sR = storage.sR.get_tensor(
+                cute.make_layout((self.sR_rows, self.d_rel, self.q_stage),
+                                 stride=(self.d_rel, 1, self.sR_rows * self.d_rel))
+            )
 
         thr_mma_qk = tiled_mma_qk.get_slice(mma_tile_coord_v)
         thr_mma_pv = tiled_mma_pv.get_slice(mma_tile_coord_v)
@@ -1339,6 +1430,8 @@ class FlashAttentionForwardSm100:
                 SeqlenInfoCls,
                 blocksparse_tensors,
                 tile_scheduler=tile_scheduler,
+                pipeline_bias=pipeline_bias,
+                pipeline_p_consumed=pipeline_p_consumed,
             )
             # Dealloc the tensor memory buffer
             tmem.relinquish_alloc_permit()
@@ -1448,6 +1541,13 @@ class FlashAttentionForwardSm100:
                 SeqlenInfoCls,
                 blocksparse_tensors,
                 tile_scheduler=tile_scheduler,
+                pipeline_bias=pipeline_bias,
+                pipeline_p_consumed=pipeline_p_consumed,
+                sB=sB,
+                sP=sP,
+                sR=sR,
+                mRelR=mRelR,
+                mRelP=mRelP,
             )
             tmem_alloc_barrier.arrive()
 
@@ -1717,10 +1817,13 @@ class FlashAttentionForwardSm100:
         SeqlenInfoCls: Callable,
         blocksparse_tensors: Optional[BlockSparseTensors],
         tile_scheduler=None,
+        pipeline_bias: Optional[pipeline.PipelineAsync] = None,
+        pipeline_p_consumed: Optional[pipeline.PipelineAsync] = None,
     ):
         tSrQ = tiled_mma_qk.make_fragment_A(sQ)
         tSrK = tiled_mma_qk.make_fragment_B(sK)
         tOrV = tiled_mma_pv.make_fragment_B(sV)
+        bias_consumer_phase = Int32(0)
         if const_expr(self.q_stage == 2):
             tSrQs = (tSrQ[None, None, None, 0], tSrQ[None, None, None, 1])
         else:
@@ -1759,7 +1862,8 @@ class FlashAttentionForwardSm100:
                 idesc_var_name="fa_fwd_qk_mma_idesc",
                 kind=qk_mma_kind,
                 smem_offset=-sQ_stage_stride if stage == 0 else sQ_stage_stride,
-                zero_init=True,
+                # With rel_bias the correction warps pre-fill S with the bias tile.
+                zero_init=not self.rel_bias,
                 cta_group=self.cta_group_size,
             )
             for stage in range(self.q_stage)
@@ -1862,6 +1966,9 @@ class FlashAttentionForwardSm100:
                     sK_cur = sK[None, None, None, Ki_index]
                     if const_expr(self.uneven_kv_smem):
                         sK_cur = self.offset_kv_smem(sK_cur, Ki_index, Ki_phase)
+                    if const_expr(self.rel_bias):
+                        # S[stage] must already hold this block's bias tile.
+                        pipeline_bias.consumer_wait_w_index_phase(stage, bias_consumer_phase)
                     # gemm_Si[stage](tCrB=tSrKi, sB=sK_cur)
                     gemm_Si[stage](
                         smem_desc_start_b=sm100_desc.make_smem_desc_start_addr(sK_cur.iterator)
@@ -1870,6 +1977,8 @@ class FlashAttentionForwardSm100:
                     # 4. release S0 / S1
                     pipeline_s_p_o.producer_commit_w_index(stage)
                 mma_q_consumer_phase ^= 1
+                if const_expr(self.rel_bias):
+                    bias_consumer_phase ^= 1
                 # 5. release K0
                 pipeline_kv.consumer_release(mma_kv_consumer_state)
                 mma_kv_consumer_state.advance()
@@ -1907,6 +2016,10 @@ class FlashAttentionForwardSm100:
                             mbar_ptr=pipeline_p_lastsplit.sync_object_full.get_barrier(stage) if self.split_P_arrive > 0 else None,
                             mbar_phase=P_full_O_rescaled_phase,
                         )
+                        if const_expr(self.rel_bias):
+                            # P[stage] consumed: the correction warps may now write the hi
+                            # half of the next block's bias into S[stage].
+                            pipeline_p_consumed.producer_commit_w_index(stage)
                         # Don't need to signal O_full to the correction warps since the
                         # correction warps wait for the softmax warps anyway. By the time the softmax
                         # warps finished, S_i for the next iteration must have been done, so O_i-1
@@ -1932,6 +2045,8 @@ class FlashAttentionForwardSm100:
                         sK_cur = sK[None, None, None, Ki_index]
                         if const_expr(self.uneven_kv_smem):
                             sK_cur = self.offset_kv_smem(sK_cur, Ki_index, Ki_phase)
+                        if const_expr(self.rel_bias):
+                            pipeline_bias.consumer_wait_w_index_phase(stage, bias_consumer_phase)
                         # gemm_Si[stage](tCrB=tSrK[None, None, None, Ki_index], sB=sK_cur)
                         gemm_Si[stage](
                             smem_desc_start_b=sm100_desc.make_smem_desc_start_addr(sK_cur.iterator)
@@ -1945,6 +2060,8 @@ class FlashAttentionForwardSm100:
                     mma_kv_consumer_state.advance()
                     P_full_O_rescaled_phase ^= 1
                     O_should_accumulate = True
+                    if const_expr(self.rel_bias):
+                        bias_consumer_phase ^= 1
                 # End of seqlen_kv loop
 
                 # release Q0 & Q1
@@ -2578,10 +2695,22 @@ class FlashAttentionForwardSm100:
         SeqlenInfoCls: Callable,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         tile_scheduler=None,
+        pipeline_bias: Optional[pipeline.PipelineAsync] = None,
+        pipeline_p_consumed: Optional[pipeline.PipelineAsync] = None,
+        sB: Optional[cute.Tensor] = None,
+        sP: Optional[cute.Tensor] = None,
+        sR: Optional[cute.Tensor] = None,
+        mRelR: Optional[cute.Tensor] = None,
+        mRelP: Optional[cute.Tensor] = None,
     ):
         tidx = cute.arch.thread_idx()[0] % (cute.arch.WARP_SIZE * len(self.correction_warp_ids))
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
         mma_tile_coord_v = thr_mma_qk.thr_idx
+        p_consumed_phase = Int32(0)
+        rel = None
+        if const_expr(self.rel_bias):
+            rel = self._rel_bias_setup(tStS, sB, sP, sR, tidx, warp_idx, block_info)
+        dbg_cond = False
 
         tScS = thr_mma_qk.partition_C(cute.make_identity_tensor(self.mma_tiler_qk[:2]))
         tStScale_layout = cute.composition(tStS.layout, cute.make_layout((self.m_block_size, 1)))
@@ -2619,6 +2748,7 @@ class FlashAttentionForwardSm100:
                 softmax_scale_log2_eff = softmax_scale_log2 * qk_descale
             else:
                 softmax_scale_log2_eff = softmax_scale_log2
+            dbg_cond = (tidx == 0) & (m_block == 20) & (head_idx == 7) & (batch_idx == 1)
 
             # Must match the softmax warp's max_offset; max_offset_scale = 2^max_offset.
             max_offset = Float32(8.0) if cutlass.const_expr(self.q_dtype.width == 8) else Float32(0.0)
@@ -2670,6 +2800,18 @@ class FlashAttentionForwardSm100:
                 has_work = self.process_work_tile(seqlen, n_block_min, n_block_max)
 
             if has_work:
+                if const_expr(self.rel_bias):
+                    # Stage this tile's r rows and block 0's P windows, then block 0:
+                    # S is free at tile start, write both halves at once.
+                    for stage in cutlass.range_constexpr(self.q_stage):
+                        self.rel_bias_load_r(rel, mRelR, stage, m_block, head_idx, batch_idx)
+                        self.rel_bias_load_p(rel, mRelP, stage, m_block, n_block_max - 1)
+                    self.rel_bias_wait_operands()
+                    for stage in cutlass.range_constexpr(self.q_stage):
+                        self.rel_bias_compute(rel, stage, m_block, n_block_max - 1)
+                        self.rel_bias_store(rel, stage, 0, 4)
+                        self.rel_bias_arrive(pipeline_bias, stage)
+                        self.rel_bias_prefetch_next(rel, mRelP, stage, m_block, n_block_max - 2, total_block_count > 1)
                 # Ignore first signal from softmax as no correction is required
                 # pipeline_sm_stats.consumer_wait_w_index_phase(0, sm_stats_consumer_phase)
                 sm_stats_barrier.arrive_and_wait_w_index(index=0 * 4 + warp_idx)
@@ -2678,6 +2820,20 @@ class FlashAttentionForwardSm100:
                     # pipeline_sm_stats.consumer_wait_w_index_phase(1, sm_stats_consumer_phase)
                     sm_stats_barrier.arrive_and_wait_w_index(index=1 * 4 + warp_idx)
                 sm_stats_consumer_phase ^= 1
+                if const_expr(self.rel_bias):
+                    # Block 1: the softmax has pulled S(0) into registers (it sent its
+                    # stats), so the lo half is free; the hi half still holds P(0) until
+                    # the MMA's PV(0) commit.
+                    if total_block_count > 1:
+                        self.rel_bias_wait_operands()
+                        for stage in cutlass.range_constexpr(self.q_stage):
+                            self.rel_bias_compute(rel, stage, m_block, n_block_max - 2)
+                            self.rel_bias_store(rel, stage, 0, 2)
+                            pipeline_p_consumed.consumer_wait_w_index_phase(stage, p_consumed_phase)
+                            self.rel_bias_store(rel, stage, 2, 4)
+                            self.rel_bias_arrive(pipeline_bias, stage)
+                            self.rel_bias_prefetch_next(rel, mRelP, stage, m_block, n_block_max - 3, total_block_count > 2)
+                    p_consumed_phase ^= Int32(total_block_count > 1)
 
                 tSrScale_t2r = cute.make_rmem_tensor(tSrScale_t2r_shape, Float32)
                 for i in cutlass.range(total_block_count - 1, unroll=1):
@@ -2685,6 +2841,8 @@ class FlashAttentionForwardSm100:
                         # wait for S0 / S1
                         # pipeline_sm_stats.consumer_wait_w_index_phase(stage, sm_stats_consumer_phase)
                         sm_stats_barrier.arrive_and_wait_w_index(index=stage * 4 + warp_idx)
+                        if const_expr(self.rel_bias):
+                            self._dbg(mRelR, seqlen.seqlen_q, 14 + stage, n_block_max - 2 - i, dbg_cond)
                         # cute.copy(tiled_tmem_load_vec, tStScales_t2r[stage], tSrScale_t2r)
                         # cute.arch.fence_view_async_tmem_load()
                         # scale = tSrScale_t2r[0]
@@ -2700,7 +2858,30 @@ class FlashAttentionForwardSm100:
                         # Notify mma warp that O has been rescaled
                         pipeline_s_p_o.consumer_release_w_index(stage)
                         pipeline_sm_stats.consumer_release_w_index(self.q_stage - 1 - stage)
+                        if const_expr(self.rel_bias):
+                            self._dbg(mRelR, seqlen.seqlen_q, 16 + stage, n_block_max - 2 - i, dbg_cond)
+                            # This iteration handled block i+1's stats: S(i+1) is in the
+                            # softmax's registers, so block i+2's bias can go into the lo
+                            # half now and into the hi half once PV(i+1) has consumed P.
+                            if i + 2 < total_block_count:
+                                nbp = n_block_max - 3 - i
+                                self._dbg(mRelR, seqlen.seqlen_q, 0 + stage, nbp, dbg_cond)
+                                self.rel_bias_wait_operands()
+                                self._dbg(mRelR, seqlen.seqlen_q, 2 + stage, nbp, dbg_cond)
+                                self.rel_bias_compute(rel, stage, m_block, nbp)
+                                self._dbg(mRelR, seqlen.seqlen_q, 4 + stage, nbp, dbg_cond)
+                                self.rel_bias_store(rel, stage, 0, 2)
+                                self._dbg(mRelR, seqlen.seqlen_q, 6 + stage, nbp, dbg_cond)
+                                pipeline_p_consumed.consumer_wait_w_index_phase(stage, p_consumed_phase)
+                                self._dbg(mRelR, seqlen.seqlen_q, 8 + stage, nbp, dbg_cond)
+                                self.rel_bias_store(rel, stage, 2, 4)
+                                self.rel_bias_arrive(pipeline_bias, stage)
+                                self._dbg(mRelR, seqlen.seqlen_q, 10 + stage, nbp, dbg_cond)
+                                self.rel_bias_prefetch_next(rel, mRelP, stage, m_block, n_block_max - 4 - i, i + 3 < total_block_count)
+                                self._dbg(mRelR, seqlen.seqlen_q, 12 + stage, nbp, dbg_cond)
                     sm_stats_consumer_phase ^= 1
+                    if const_expr(self.rel_bias):
+                        p_consumed_phase ^= Int32(i + 2 < total_block_count)
                     # o_corr_consumer_phase ^= 1
                 if const_expr(self.q_stage == 2):
                     pipeline_sm_stats.consumer_release_w_index(1)
@@ -2878,6 +3059,278 @@ class FlashAttentionForwardSm100:
         # This is equivalent to pipeline_o_epi.consumer_tail() for the correction warps
         if const_expr(not self.use_correction_warps_for_epi):
             pipeline_o_epi.producer_acquire_w_index_phase(self.q_stage - 1, corr_epi_producer_phase)
+
+    class _RelBiasCtx(NamedTuple):
+        tStS: cute.Tensor
+        sB: cute.Tensor
+        sP: cute.Tensor
+        sR: cute.Tensor
+        thr_copy_p: object
+        thr_copy_r: object
+        tiled_copy_p: cute.TiledCopy
+        tiled_copy_r: cute.TiledCopy
+        tidx: Int32
+        warp_idx: Int32
+        lane: Int32
+        grp: Int32
+        tig: Int32
+        d_off: Int32
+
+    @cute.jit
+    def _dbg(self, mRelR, seqlen_q, event: cutlass.Constexpr[int], n_block: Int32, cond):
+        """TEMP timeline probe into r's zero padding rows: slot = event*96 + n_block."""
+        if const_expr(os.environ.get("REL_BIAS_TIMELINE") == "1" and mRelR is not None):
+            if cond:
+                t = cute.make_tensor(
+                    cute.recast_ptr(utils.elem_pointer(mRelR, (0, seqlen_q, 0, 0)), dtype=Int64),
+                    cute.make_layout((24 * 96,)),
+                )
+                t[event * 96 + n_block % 96] = cute.arch.clock64()
+
+    REL_BIAS_BARRIER_ID = 11  # named barrier for the 128 correction threads (3..10 = softmax stats)
+
+    def _rel_bias_setup(self, tStS, sB, sP, sR, tidx, warp_idx, block_info):
+        """Per-thread constants for the bias production (trace-time only)."""
+        lane = tidx % cute.arch.WARP_SIZE
+        # cp.async G2S staging: 16 B per thread per row half, 2 threads per 32 B row.
+        n_thr = cute.arch.WARP_SIZE * len(self.correction_warp_ids)
+        tiled_copy_p = copy_utils.tiled_copy_2d(Float16, 2, n_thr, 8, is_async=True)
+        tiled_copy_r = copy_utils.tiled_copy_2d(Float16, 2, n_thr, 8, is_async=True)
+        # Row i of P holds distance d = d_off - i (host-side reversal + zero padding).
+        d_off = block_info.window_size_left + 1 + 256
+        return self._RelBiasCtx(
+            tStS, sB, sP, sR, tiled_copy_p.get_slice(tidx), tiled_copy_r.get_slice(tidx),
+            tiled_copy_p, tiled_copy_r, tidx, warp_idx, lane, lane // 4, lane % 4, d_off,
+        )
+
+    def _rel_bias_mma(self, lane):
+        """Warp MMA for the bias production (trace-time objects; built inside each jit
+        method because partition shapes do not survive the jit argument boundary)."""
+        # f16 in / f16 accumulate: the accumulator pairs are then already packed f16x2
+        # and go to smem with a single 32-bit store, no conversion.
+        warp_mma = cute.make_tiled_mma(warp.MmaF16BF16Op(Float16, Float16, (16, 8, 16)))
+        return warp_mma, warp_mma.get_slice(lane)
+
+    def _rel_bias_tmem_store(self, tStS, tidx, stage):
+        chunk = 32
+        tmem_store_atom = cute.make_copy_atom(
+            tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(chunk)), self.qk_acc_dtype
+        )
+        tStS_i = cute.composition(
+            tStS[None, None, None, stage], cute.make_layout((self.m_block_size, chunk))
+        )
+        thr_st = tcgen05.make_tmem_copy(tmem_store_atom, tStS_i).get_slice(tidx)
+        frag_shape = thr_st.partition_S(cute.make_identity_tensor((self.m_block_size, chunk))).shape
+        return thr_st, thr_st.partition_D(tStS_i), frag_shape
+
+    @cute.jit
+    def rel_bias_load_r(self, rel, mRelR: cute.Tensor, stage: cutlass.Constexpr[int], m_block: Int32, head_idx: Int32, batch_idx: Int32):
+        """cp.async the q-tile's 128 rows of r (B, T+256, H, 16) into sR[:, :, stage]."""
+        nheads = mRelR.shape[2]
+        q_tile0 = m_block * (self.q_stage * self.m_block_size) + stage * self.m_block_size
+        # Rows are 32 B, so the 16 B cp.async alignment holds; restate it for the verifier.
+        gR = cute.make_tensor(
+            cute.make_ptr(
+                Float16,
+                utils.elem_pointer(mRelR, (batch_idx, q_tile0, head_idx, 0)).toint(),
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            ),
+            cute.make_layout((self.sR_rows, self.d_rel), stride=(nheads * self.d_rel, 1)),
+        )
+        cute.copy(rel.tiled_copy_r, rel.thr_copy_r.partition_S(gR),
+                  rel.thr_copy_r.partition_D(rel.sR[None, None, stage]))
+        cute.arch.cp_async_commit_group()
+
+    @cute.jit
+    def rel_bias_load_p(self, rel, mRelP: cute.Tensor, stage: cutlass.Constexpr[int], m_block: Int32, n_block: Int32):
+        """cp.async the P rows used by (q-tile m_block/stage, k-tile n_block) into sP[:, :, stage].
+
+        Threads touch P rows [row0, row0 + 160) with row0 = d_off - (d0 + base + 30) and
+        base in [0, 97], i.e. the 257-row window starting at d_off - d0 - 127; it is
+        staged as 320 rows so the 2-threads-per-row copy tiles it exactly.
+        """
+        q_tile0 = m_block * (self.q_stage * self.m_block_size) + stage * self.m_block_size
+        d0 = q_tile0 - n_block * self.n_block_size
+        win_lo = rel.d_off - d0 - 127
+        gP = cute.make_tensor(
+            cute.make_ptr(
+                Float16,
+                utils.elem_pointer(mRelP, (win_lo, 0)).toint(),
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            ),
+            cute.make_layout((self.sP_rows, self.d_rel), stride=(self.d_rel, 1)),
+        )
+        cute.copy(rel.tiled_copy_p, rel.thr_copy_p.partition_S(gP),
+                  rel.thr_copy_p.partition_D(rel.sP[None, None, stage]))
+        cute.arch.cp_async_commit_group()
+
+    @cute.jit
+    def rel_bias_prefetch_next(self, rel, mRelP: cute.Tensor, stage: cutlass.Constexpr[int], m_block: Int32, n_block: Int32, valid):
+        """After this stage's production: every warp is done reading sP[stage], refill it
+        with the next block's window (issued early, waited for right before use)."""
+        cute.arch.barrier(barrier_id=self.REL_BIAS_BARRIER_ID, number_of_threads=cute.arch.WARP_SIZE * len(self.correction_warp_ids))
+        if valid:
+            self.rel_bias_load_p(rel, mRelP, stage, m_block, n_block)
+
+    @cute.jit
+    def rel_bias_wait_operands(self):
+        cute.arch.cp_async_wait_group(0)
+        cute.arch.barrier(barrier_id=self.REL_BIAS_BARRIER_ID, number_of_threads=cute.arch.WARP_SIZE * len(self.correction_warp_ids))
+
+    @cute.jit
+    def rel_bias_compute(
+        self,
+        rel,
+        stage: cutlass.Constexpr[int],
+        m_block: Int32,
+        n_block: Int32,
+    ):
+        """Warp w computes bias rows 32w..32w+31 of (q-tile m_block/stage, k-tile n_block)
+        and writes them sheared into its rows of sB: sB[1 + u][v] = bias(q_u, k_v).
+
+        bias(q, k) = r[q] . P[:, q - k]. Each warp runs two 16-row m16n8k16 MMAs over
+        rows u = base + 2i (base = 32w, 32w+1): thread (grp, tig) = (lane/4, lane%4)
+        owns rows i = grp, grp+8 and the column pair j = 2*tig, so every accumulator
+        pair (d, d+1) lands on an even column v = 8*cb + j + 2i - 30 and is stored as
+        one f16x2 at a per-thread base plus a static offset. Operands come from the
+        staged smem copies: r rows of the q-tile and the P window, in which column
+        block cb is the 8 consecutive rows starting at (97 - base) + 8cb. Only the edge
+        column blocks can leave the tile; those are clamped into the pad columns / the
+        leading pad row.
+        """
+        if const_expr(os.environ.get("REL_BIAS_DIAG") == "zero"):  # TEMP: exactness test
+            row = 1 + 32 * rel.warp_idx + rel.lane
+            rZ = cute.make_rmem_tensor(self.n_block_size, Float16)
+            rZ.store(cute.full_like(rZ.load(), 0.0))
+            cute.autovec_copy(
+                rZ, cute.make_tensor(utils.elem_pointer(rel.sB, (row, 0)), cute.make_layout((self.n_block_size,)))
+            )
+            return
+        warp_mma, thr_mma = self._rel_bias_mma(rel.lane)
+        q_tile0 = m_block * (self.q_stage * self.m_block_size) + stage * self.m_block_size
+        d0 = q_tile0 - n_block * self.n_block_size  # q_u - k_v = d0 + u - v
+        # The k-tile right of a q-tile (d0 <= -128) is entirely causal-masked: the tile's
+        # contents never reach the softmax, so skip the whole production.
+        if d0 > -self.n_block_size:
+            self._rel_bias_compute_body(rel, warp_mma, thr_mma, stage, d0)
+        cute.arch.sync_warp()
+
+    @cute.jit
+    def _rel_bias_compute_body(self, rel, warp_mma, thr_mma, stage: cutlass.Constexpr[int], d0: Int32):
+        # Per-block-of-16-rows constants: A fragment (r rows base + 2i) and the two
+        # output row pointers of this thread.
+        tArA = []
+        pB = []
+        pD = []
+        for blk in cutlass.range_constexpr(2):
+            base = 32 * rel.warp_idx + blk
+            sA = cute.make_tensor(
+                utils.elem_pointer(rel.sR, (base, 0, stage)),
+                cute.make_layout((16, 16), stride=(2 * self.d_rel, 1)),
+            )
+            tAsA = thr_mma.partition_A(sA)
+            tA = thr_mma.make_fragment_A(tAsA)
+            cute.autovec_copy(tAsA, tA)
+            tArA.append(tA)
+            rows = []
+            for pr in cutlass.range_constexpr(2):
+                row = 1 + base + 2 * (rel.grp + 8 * pr)
+                v0 = 2 * rel.tig + 2 * (rel.grp + 8 * pr) - 30
+                # 32-bit pointers (v0 and v are even): one STS.32 per pair instead of the
+                # two 16-bit stores + PRMT the compiler emits for an unaligned f16 pair.
+                # The pointer at column v0 may be negative (previous row's pad), so
+                # interior column blocks store at a static immediate offset from it.
+                rowptr = utils.elem_pointer(rel.sB, (row, 0))
+                rows.append((
+                    cute.make_ptr(Int32, rowptr.toint(), cute.AddressSpace.smem, assumed_align=4),
+                    v0,
+                    cute.make_ptr(Int32, (rowptr + v0).toint(), cute.AddressSpace.smem, assumed_align=4),
+                ))
+            pD.append(rows)
+        # mma.sync results are consumed ~50 cycles after issue; issue 8 independent
+        # MMAs (4 column blocks of each row block) before storing any of them so the
+        # latencies overlap instead of serializing 40 times. (ldmatrix.x4 B loads and a
+        # per-batch skip of masked distances were both measured slower: the 32 B row
+        # pitch makes ldmatrix 2-way bank conflicted, and a dynamic branch per batch
+        # blocks the cross-batch scheduling.)
+        n_cb = 20
+        per_batch = 4
+        shape_c = thr_mma.partition_shape_C((16, 8))
+        tBsB = thr_mma.partition_B(
+            cute.make_tensor(
+                cute.make_ptr(Float16, 0, cute.AddressSpace.smem, assumed_align=16),
+                cute.make_layout((8, 16), stride=(16, 1)),
+            )
+        )
+        # This thread's B fragment pointer per row block: window row (97 - base) + grp,
+        # k = 2tig (..+1) and +8 (..+9); column block cb adds 8 rows.
+        pB = []
+        for blk in cutlass.range_constexpr(2):
+            base = 32 * rel.warp_idx + blk
+            pB.append(
+                cute.make_ptr(
+                    Float16,
+                    utils.elem_pointer(rel.sP, (97 - base + rel.grp, 2 * rel.tig, stage)).toint(),
+                    cute.AddressSpace.smem,
+                    assumed_align=4,
+                )
+            )
+        for batch in cutlass.range_constexpr(n_cb // per_batch):
+            accs = []
+            for blk in cutlass.range_constexpr(2):
+                for t in cutlass.range_constexpr(per_batch):
+                    cb = batch * per_batch + t
+                    tBrB = thr_mma.make_fragment_B(tBsB)
+                    cute.autovec_copy(
+                        cute.make_tensor(pB[blk] + 8 * self.d_rel * cb, cute.make_layout((2,))),
+                        cute.make_tensor(tBrB.iterator, cute.make_layout((2,))),
+                    )
+                    cute.autovec_copy(
+                        cute.make_tensor(pB[blk] + 8 * self.d_rel * cb + 8, cute.make_layout((2,))),
+                        cute.make_tensor(tBrB.iterator + 2, cute.make_layout((2,))),
+                    )
+                    tCrD = thr_mma.make_fragment_C(shape_c)
+                    # In-place accumulate from an explicit zero (folds to RZ): the
+                    # out-of-place form (separate C and D) produced NaNs with this DSL.
+                    tCrD.store(cute.full_like(tCrD.load(), 0.0))
+                    cute.gemm(warp_mma, tCrD, tArA[blk][None, None, 0], tBrB[None, None, 0], tCrD)
+                    accs.append((blk, cb, tCrD))
+            for blk, cb, tCrD in accs:
+                # The f16 accumulator as two packed f16x2 words (rows grp, grp+8).
+                acc32 = cute.make_tensor(cute.recast_ptr(tCrD.iterator, dtype=Int32), cute.make_layout((2,)))
+                for pr in cutlass.range_constexpr(2):
+                    rowptr32, v0, basep32 = pD[blk][pr]
+                    if const_expr(4 <= cb < 16):
+                        # v = v0 + 8cb is always inside [0, 126] here: static word offset.
+                        dst = cute.make_tensor(basep32 + 4 * cb, cute.make_layout((1,)))
+                    else:
+                        v = cutlass.min(cutlass.max(v0 + 8 * cb, -2), self.n_block_size)
+                        dst = cute.make_tensor(rowptr32 + (v >> 1), cute.make_layout((1,)))
+                    dst[0] = acc32[pr]
+
+    @cute.jit
+    def rel_bias_store(self, rel, stage: cutlass.Constexpr[int], c0: cutlass.Constexpr[int], c1: cutlass.Constexpr[int]):
+        """tcgen05.st 32-column chunks [c0, c1) of this thread's bias row into S[stage]."""
+        thr_st, tStS_r2t, frag_shape = self._rel_bias_tmem_store(rel.tStS, rel.tidx, stage)
+        row = 1 + 32 * rel.warp_idx + rel.lane
+        for c in cutlass.range_constexpr(c0, c1):
+            src = cute.make_tensor(utils.elem_pointer(rel.sB, (row, 32 * c)), cute.make_layout((32,)))
+            rh = cute.make_rmem_tensor(32, Float16)
+            cute.autovec_copy(src, rh)
+            frag = cute.make_rmem_tensor(frag_shape, self.qk_acc_dtype)
+            frag_flat = cute.make_tensor(frag.iterator, cute.make_layout((32,)))
+            frag_flat.store(rh.load().to(self.qk_acc_dtype))
+            dst = cute.make_tensor(tStS_r2t.iterator + 32 * c, tStS_r2t.layout)
+            cute.copy(thr_st, frag, dst)
+
+    @cute.jit
+    def rel_bias_arrive(self, pipeline_bias, stage: cutlass.Constexpr[int]):
+        cute.arch.fence_view_async_tmem_store()
+        cute.arch.sync_warp()
+        with cute.arch.elect_one():
+            pipeline_bias.producer_commit_w_index(stage)
 
     @cute.jit
     def correction_rescale(

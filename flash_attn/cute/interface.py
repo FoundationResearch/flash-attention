@@ -560,6 +560,8 @@ def _flash_attn_fwd(
     seqlen_k_per_split: Optional[int] = None,
     disable_scheduler_metadata: bool = False,
     window_left_chunk: Optional[int] = None,
+    rel_bias_r: Optional[torch.Tensor] = None,
+    rel_bias_p: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Forward pass for FlashAttention.
 
@@ -693,7 +695,8 @@ def _flash_attn_fwd(
         softcap = None
     qhead_per_kvhead = num_head // num_head_kv
     if pack_gqa is None:
-        pack_gqa = qhead_per_kvhead > 1
+        # The rel_bias tile is per q-head; pack_gqa would mix heads within a tile.
+        pack_gqa = qhead_per_kvhead > 1 and rel_bias_r is None
 
     is_fp8 = v.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
     if is_fp8 and requires_grad:
@@ -777,6 +780,29 @@ def _flash_attn_fwd(
         )
         assert (window_size_left + 1) % window_left_chunk == 0, (
             "window_size_left + 1 must be a multiple of window_left_chunk"
+        )
+    rel_bias = rel_bias_r is not None
+    if rel_bias:
+        assert rel_bias_p is not None, "rel_bias_r and rel_bias_p must be given together"
+        assert arch // 10 in [10, 11], "rel_bias is only implemented on the SM100 forward"
+        assert local and window_size_left is not None, "rel_bias requires a left window"
+        assert cu_seqlens_q is None and cu_seqlens_k is None and page_table is None, (
+            "rel_bias does not support varlen or paged KV"
+        )
+        # The correction warps read r rows for whole 128-row q-tiles and P rows for the
+        # full distance span of a tile pair, so both carry zero padding (see
+        # agent_space/inkling_rel_native.py::prepare_rel_bias_operands).
+        assert rel_bias_r.dim() == 4 and rel_bias_r.shape[0] == batch_size, (
+            f"rel_bias_r must be (batch, seqlen_q + 256, nheads, 16), got {tuple(rel_bias_r.shape)}"
+        )
+        assert rel_bias_r.shape[1] >= seqlen_q + 256 and rel_bias_r.shape[2:] == (num_head, 16)
+        assert rel_bias_p.dim() == 2 and rel_bias_p.shape[1] == 16
+        assert rel_bias_r.dtype == torch.float16 and rel_bias_p.dtype == torch.float16, (
+            "rel_bias operands must be float16 (the bias MMAs accumulate in f16)"
+        )
+        assert rel_bias_r.is_contiguous() and rel_bias_p.is_contiguous()
+        assert rel_bias_p.shape[0] >= window_size_left + 1 + 640, (
+            "rel_bias_p must have at least window + 640 rows"
         )
 
     requested_use_clc_scheduler = utils._get_use_clc_scheduler_default()
@@ -1132,6 +1158,7 @@ def _flash_attn_fwd(
         window_size_left is not None,
         window_size_right is not None,
         window_left_chunk,
+        rel_bias,
         (
             torch2cute_dtype_map[learnable_sink.dtype]
             if learnable_sink is not None
@@ -1194,6 +1221,8 @@ def _flash_attn_fwd(
             if page_table is not None
             else None
         )
+        rel_r_tensor = to_cute_tensor(rel_bias_r, leading_dim=3) if rel_bias else None
+        rel_p_tensor = to_cute_tensor(rel_bias_p, leading_dim=1) if rel_bias else None
         q_tensor, k_tensor, v_tensor, o_tensor = [
             to_cute_tensor(t) for t in (q, k, v, out if not is_split_kv else out_partial)
         ]
@@ -1373,6 +1402,11 @@ def _flash_attn_fwd(
                         "window_left_chunk is not supported by the hd256 2CTA kernel"
                     )
                     fa_fwd_kwargs["window_left_chunk"] = window_left_chunk
+                if rel_bias:
+                    assert not use_dedicated_hd256_kernel, (
+                        "rel_bias is not supported by the hd256 2CTA kernel"
+                    )
+                    fa_fwd_kwargs["rel_bias"] = True
                 fa_fwd = flash_fwd_obj_cls(head_dim, head_dim_v, **fa_fwd_kwargs)
         elif arch // 10 == 12:
             # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity
@@ -1458,6 +1492,8 @@ def _flash_attn_fwd(
                     cu_total_splits_m_blocks_tensor,
                     blocks_to_batch_idx_tensor,
                     max_seqlen_q,
+                    rel_r_tensor,
+                    rel_p_tensor,
                 ])
             elif arch // 10 in [8, 9, 12]:
                 compile_args.extend([
@@ -1547,6 +1583,8 @@ def _flash_attn_fwd(
                     cu_total_splits_m_blocks,
                     blocks_to_batch_idx,
                     max_seqlen_q,
+                    rel_bias_r,
+                    rel_bias_p,
                 ])
             elif arch // 10 in [8, 9, 12]:
                 call_args.extend([
